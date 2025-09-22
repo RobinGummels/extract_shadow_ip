@@ -182,6 +182,9 @@ class extract_shadow_ip(QgsProcessingAlgorithm):
             2020,
             2030,
             2040,
+            2054,
+            2055,
+            2056,
             2070,
             2071,
             2072,
@@ -219,14 +222,7 @@ class extract_shadow_ip(QgsProcessingAlgorithm):
             3031,
             3034,
             3037,
-            3040,
-            3041,
-            3042,
-            3043,
             3044,
-            3045,
-            3046,
-            3047,
             3048,
             3050,
             3051,
@@ -240,6 +236,7 @@ class extract_shadow_ip(QgsProcessingAlgorithm):
             3064,
             3065,
             3066,
+            3070,
             3071,
             3072,
             3073,
@@ -267,6 +264,8 @@ class extract_shadow_ip(QgsProcessingAlgorithm):
             2212,
             2213,
             2220,
+            2422,
+            2431,
             2442,
             2444,
             2460,
@@ -283,7 +282,17 @@ class extract_shadow_ip(QgsProcessingAlgorithm):
             2726,
             2727,
             2728,
+            3040,
+            3041,
+            3042,
+            3043,
+            3045,
+            3046,
+            3047,
             3074,
+            3080,
+            3081,
+            3082,
             3262,
             3264,
         ]
@@ -294,9 +303,6 @@ class extract_shadow_ip(QgsProcessingAlgorithm):
             2051,
             2052,
             2053,
-            2054,
-            2055,
-            2056,
             2091,
             2100,
             2110,
@@ -317,11 +323,9 @@ class extract_shadow_ip(QgsProcessingAlgorithm):
             2410,
             2412,
             2420,
-            2422,
             2423,
             2424,
             2430,
-            2431,
             2440,
             2441,
             2443,
@@ -365,10 +369,6 @@ class extract_shadow_ip(QgsProcessingAlgorithm):
             3035,
             3036,
             3038,
-            3070,
-            3080,
-            3081,
-            3082,
             3090,
             3091,
             3092,
@@ -455,7 +455,9 @@ class extract_shadow_ip(QgsProcessingAlgorithm):
             if closest_point:
                 feature = QgsFeature()
                 feature.setGeometry(closest_point)
-                importance = importance_list[current]  # Verwende den berechneten Wert aus der Liste
+                importance = importance_list[
+                    current
+                ]  # Verwende den berechneten Wert aus der Liste
                 attrs = building_feature.attributes() + [importance]
                 feature.setAttributes(attrs)
 
