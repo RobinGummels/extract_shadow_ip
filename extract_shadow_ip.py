@@ -406,10 +406,13 @@ class extract_shadow_ip(QgsProcessingAlgorithm):
                 else ""
             )
             importance = 0  # Fallback if gfkzshh is missing
-            for code in yes:
-                if gfkzshh.endswith(str(code)):
-                    importance = 3
-                    break
+
+            # Erste Zuordnung basierend auf gfkzshh
+            if importance == 0:
+                for code in yes:
+                    if gfkzshh.endswith(str(code)):
+                        importance = 3
+                        break
             if importance == 0:
                 for code in no:
                     if gfkzshh.endswith(str(code)):
@@ -420,6 +423,22 @@ class extract_shadow_ip(QgsProcessingAlgorithm):
                     if gfkzshh.endswith(str(code)):
                         importance = 2
                         break
+
+            # Wenn das Nachbargebäude importance 3 hat und das eigene Gebäude < 3, dann bekommt dieses Gebäude eine 1
+            if importance < 3:
+                for other_feature in building_features:
+                    if building_feature.geometry().intersects(other_feature.geometry()):
+                        if other_feature != building_feature:
+                            other_gfkzshh = (
+                                str(other_feature.attribute("gfkzshh"))
+                                if building_feature.attribute("gfkzshh") is not None
+                                else ""
+                            )
+                            for code in yes:
+                                if other_gfkzshh.endswith(str(code)):
+                                    importance = 1
+                                    break
+            # Füge den berechneten Wert der Liste hinzu
             importance_list.append(importance)
             feedback.setProgress(int((current * total) / 2))
 
