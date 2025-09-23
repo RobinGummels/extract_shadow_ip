@@ -14,8 +14,11 @@ from qgis.core import (
     QgsProcessingParameterFeatureSink,
     QgsProcessingParameterFeatureSource,
     QgsProcessingParameterVectorLayer,
+    QgsProcessingParameterNumber,
     QgsWkbTypes,
     QgsField,
+    QgsVectorLayer,
+    QgsPointXY,
 )
 from qgis import processing
 
@@ -61,6 +64,17 @@ class extract_shadow_ip(QgsProcessingAlgorithm):
             )
         )
 
+        # Threshold für Voronoi-Ausdünnung
+        self.addParameter(
+            QgsProcessingParameterNumber(
+                "area_threshold",
+                self.tr("Area threshold for Voronoi thinning (m²)"),
+                type=QgsProcessingParameterNumber.Double,
+                defaultValue=25000.0,
+                minValue=1.0
+            )
+        )
+
         # Output layers für verschiedene Importance-Klassen
         self.addParameter(
             QgsProcessingParameterFeatureSink(
@@ -88,14 +102,74 @@ class extract_shadow_ip(QgsProcessingAlgorithm):
         feedback: QgsProcessingFeedback,
     ) -> dict[str, Any]:
         """
-        Processing
+        Main processing function that coordinates all algorithm steps.
+        
+        Progress distribution:
+        - Building classification: 30%
+        - Point extraction: 50% 
+        - Voronoi thinning: 20%
         """
+        
+        # Retrieve and validate inputs
+        input_buildings, input_zb_wea, area_threshold = self._validate_inputs(
+            parameters, context
+        )
+        
+        # Setup output sinks
+        sinks, dest_ids, fields = self._setup_output_sinks(
+            parameters, context, input_buildings
+        )
+        
+        # Get building features
+        building_features = list(input_buildings.getFeatures())
+        
+        # Step 1: Classify buildings (0-30%)
+        feedback.pushInfo("Starting building classification...")
+        importance_list = self._classify_buildings(
+            building_features, feedback, progress_start=0, progress_end=30
+        )
+        
+        # Step 2: Extract shadow points (30-50%)
+        feedback.pushInfo("Extracting shadow points...")
+        all_created_features = self._extract_shadow_points(
+            building_features, input_zb_wea, importance_list, fields,
+            feedback, progress_start=30, progress_end=50
+        )
+        
+        # Step 3: Voronoi thinning (50-70%)
+        feedback.pushInfo("Starting Voronoi thinning...")
+        thinned_features = self._perform_voronoi_thinning(
+            all_created_features, area_threshold, input_buildings.sourceCrs(),
+            context, feedback, progress_start=50, progress_end=70
+        )
+        
+        # Step 4: Write final results (70-100%)
+        feedback.pushInfo("Writing final results...")
+        self._write_final_results(
+            all_created_features, thinned_features, sinks,
+            feedback, progress_start=70, progress_end=100
+        )
+        
+        return {
+            "output_importance_0": dest_ids[0],
+            "output_importance_1": dest_ids[1],
+            "output_importance_2": dest_ids[2],
+            "output_importance_3": dest_ids[3],
+        }
 
+    def _validate_inputs(self, parameters, context):
+        """
+        Validate and retrieve input parameters.
+        
+        Returns:
+            tuple: (input_buildings, input_zb_wea, area_threshold)
+        """
         # Retrieve the inputs
         input_buildings = self.parameterAsSource(
             parameters, self.input_buildings, context
         )
         input_zb_wea = self.parameterAsSource(parameters, self.input_zb_wea, context)
+        area_threshold = self.parameterAsDouble(parameters, "area_threshold", context)
 
         # If input was not found, throw an exception
         if input_buildings is None:
@@ -107,7 +181,16 @@ class extract_shadow_ip(QgsProcessingAlgorithm):
             raise QgsProcessingException(
                 self.invalidSourceError(parameters, self.input_zb_wea)
             )
+            
+        return input_buildings, input_zb_wea, area_threshold
 
+    def _setup_output_sinks(self, parameters, context, input_buildings):
+        """
+        Setup output feature sinks for each importance class.
+        
+        Returns:
+            tuple: (sinks, dest_ids, fields)
+        """
         # Felder kopieren und 'importance' hinzufügen
         fields = input_buildings.fields()
         fields.append(QgsField("importance", QVariant.Int))
@@ -128,33 +211,22 @@ class extract_shadow_ip(QgsProcessingAlgorithm):
             sinks[importance] = sink
             dest_ids[importance] = dest_id
 
-        # If sink was not created, throw an exception to indicate that the algorithm
-        # encountered a fatal error. The exception text can be any string, but in this
-        # case we use the pre-built invalidSinkError method to return a standard
-        # helper text for when a sink cannot be evaluated
-        if sink is None:
+        # If sink was not created, throw an exception
+        if any(sink is None for sink in sinks.values()):
             raise QgsProcessingException(
-                self.invalidSinkError(parameters, self.output_ip)
+                self.invalidSinkError(parameters, "output_importance_0")
             )
+            
+        return sinks, dest_ids, fields
 
-        # Compute the number of steps to display within the progress bar and
-        # get features from source
-        total = (
-            100.0 / input_buildings.featureCount()
-            if input_buildings.featureCount()
-            else 0
-        )
-        building_features = list(input_buildings.getFeatures())
-
-        # Send some information to the user
-        feedback.pushInfo("Adding building type categories")
-        feedback.pushInfo("3 = definitly needed")
-        feedback.pushInfo("2 = maybe needed")
-        feedback.pushInfo("1 = definitely not needed")
-        feedback.pushInfo("0 = unknown (gfkzshh missing/could'nt be matched)")
-
-        # Setup Categorie Codes
-        yes = [
+    def _get_building_classification_codes(self):
+        """
+        Get the classification codes for building importance assessment.
+        
+        Returns:
+            tuple: (yes_codes, no_codes, maybe_codes)
+        """
+        yes_codes = [
             1000,
             1010,
             1020,
@@ -247,7 +319,7 @@ class extract_shadow_ip(QgsProcessingAlgorithm):
             3241,
             3242,
         ]
-        no = [
+        no_codes = [
             1313,
             1610,
             2060,
@@ -296,7 +368,7 @@ class extract_shadow_ip(QgsProcessingAlgorithm):
             3262,
             3264,
         ]
-        maybe = [
+        maybe_codes = [
             2000,
             2010,
             2050,
@@ -395,10 +467,37 @@ class extract_shadow_ip(QgsProcessingAlgorithm):
             3290,
             9998,
         ]
+        
+        return yes_codes, no_codes, maybe_codes
+
+    def _classify_buildings(self, building_features, feedback, progress_start, progress_end):
+        """
+        Classify buildings based on their gfkzshh attribute and neighborhood relationships.
+        
+        Args:
+            building_features: List of building features
+            feedback: Processing feedback object
+            progress_start: Start percentage for progress bar
+            progress_end: End percentage for progress bar
+            
+        Returns:
+            list: Importance values for each building
+        """
+        feedback.pushInfo("Adding building type categories")
+        feedback.pushInfo("3 = definitly needed")
+        feedback.pushInfo("2 = maybe needed")
+        feedback.pushInfo("1 = definitely not needed")
+        feedback.pushInfo("0 = unknown (gfkzshh missing/could'nt be matched)")
+
+        # Get classification codes
+        yes_codes, no_codes, maybe_codes = self._get_building_classification_codes()
+        
         # Add extra parameter to each input_building-Feature.
         # Based on the attribute "gebnutzbez", a new attribute should be calculated
         # Berechne importance für jedes Gebäude und speichere in Liste
         importance_list = []
+        progress_range = progress_end - progress_start
+        
         for current, building_feature in enumerate(building_features):
             gfkzshh = (
                 str(building_feature.attribute("gfkzshh"))
@@ -409,17 +508,17 @@ class extract_shadow_ip(QgsProcessingAlgorithm):
 
             # Erste Zuordnung basierend auf gfkzshh
             if importance == 0:
-                for code in yes:
+                for code in yes_codes:
                     if gfkzshh.endswith(str(code)):
                         importance = 3
                         break
             if importance == 0:
-                for code in no:
+                for code in no_codes:
                     if gfkzshh.endswith(str(code)):
                         importance = 1
                         break
             if importance == 0:
-                for code in maybe:
+                for code in maybe_codes:
                     if gfkzshh.endswith(str(code)):
                         importance = 2
                         break
@@ -434,15 +533,42 @@ class extract_shadow_ip(QgsProcessingAlgorithm):
                                 if building_feature.attribute("gfkzshh") is not None
                                 else ""
                             )
-                            for code in yes:
+                            for code in yes_codes:
                                 if other_gfkzshh.endswith(str(code)):
                                     importance = 1
                                     break
             # Füge den berechneten Wert der Liste hinzu
             importance_list.append(importance)
-            feedback.setProgress(int((current * total) / 2))
+            
+            # Update progress
+            if len(building_features) > 0:
+                progress = progress_start + (current / len(building_features)) * progress_range
+                feedback.setProgress(int(progress))
+        
+        return importance_list
 
+    def _extract_shadow_points(self, building_features, input_zb_wea, importance_list, fields, feedback, progress_start, progress_end):
+        """
+        Extract shadow points from building edges that are closest to ZB-WEA points.
+        
+        Args:
+            building_features: List of building features
+            input_zb_wea: ZB-WEA point source
+            importance_list: List of importance values for buildings
+            fields: Output field structure
+            feedback: Processing feedback object
+            progress_start: Start percentage for progress bar
+            progress_end: End percentage for progress bar
+            
+        Returns:
+            list: Created features with shadow points
+        """
         feedback.pushInfo("Extracting nearest point to WEA")
+        
+        # Sammle alle Features für spätere Voronoi-Berechnung
+        all_created_features = []
+        progress_range = progress_end - progress_start
+        
         for current, building_feature in enumerate(building_features):
             # Create point on every line in the polygon
             points = []
@@ -480,37 +606,261 @@ class extract_shadow_ip(QgsProcessingAlgorithm):
                 attrs = building_feature.attributes() + [importance]
                 feature.setAttributes(attrs)
 
-                # Füge Feature zum entsprechenden Sink hinzu
-                if importance in sinks and sinks[importance] is not None:
-                    sinks[importance].addFeature(
-                        feature, QgsFeatureSink.Flag.FastInsert
-                    )
+                # Speichere Feature für Voronoi-Berechnung
+                all_created_features.append(feature)
 
-            # Update the progress bar
-            feedback.setProgress(int((current * total) / 2) + 50)
+            # Update progress
+            if len(building_features) > 0:
+                progress = progress_start + (current / len(building_features)) * progress_range
+                feedback.setProgress(int(progress))
+        
+        return all_created_features
 
-        # Implement in the future:
-        # Filter the given buildings by ATKIS OB-Katalog gebaeudenutzung
-        # Divide all buildings into "not needed", "needed" and "further check needed"
-        # Calculate Voronoi-Polygons
-        # Remove all IP with voronoi polygons smaller than a theshold
-        #   - start deleting "further check needed"
-        #   - then start deleting points with no adress
-        #   - lastly delete also other points
-        #   -> until the voronoi polygons are no longer smaller than the threshold
+    def _perform_voronoi_thinning(self, all_created_features, area_threshold, source_crs, context, feedback, progress_start, progress_end):
+        """
+        Perform Voronoi-based thinning of shadow points.
+        
+        Args:
+            all_created_features: List of all created features
+            area_threshold: Minimum area threshold for polygons
+            source_crs: Source coordinate reference system
+            context: Processing context
+            feedback: Processing feedback object
+            progress_start: Start percentage for progress bar
+            progress_end: End percentage for progress bar
+            
+        Returns:
+            list: Thinned features after Voronoi processing
+        """
+        feedback.pushInfo("Starting Voronoi thinning process...")
+        
+        # Sammle Features mit Importance 0, 2, 3 für Voronoi-Berechnung aus bereits berechneten Features
+        voronoi_points = []
+        point_importance = []
+        point_features = []
+        
+        for feature in all_created_features:
+            importance = feature.attributes()[-1]  # Importance ist das letzte Attribut
+            
+            # Nur Punkte mit Importance 0, 2, 3 für Voronoi verwenden
+            if importance in [0, 2, 3]:
+                voronoi_points.append(feature.geometry().asPoint())
+                point_importance.append(importance)
+                point_features.append(feature)
+        
+        if not voronoi_points:
+            feedback.pushInfo("No points found for Voronoi calculation")
+            return []
+        
+        iteration = 0
+        max_iterations = 50
+        progress_range = progress_end - progress_start
+        
+        while iteration < max_iterations:
+            iteration += 1
+            feedback.pushInfo(f"Voronoi iteration {iteration}, points: {len(voronoi_points)}")
+            
+            # Update progress
+            progress = progress_start + (iteration / max_iterations) * progress_range
+            feedback.setProgress(int(progress))
+            
+            if len(voronoi_points) < 3:
+                break
+                
+            # Berechne Voronoi-Polygone mit QGIS Processing
+            try:
+                # Erstelle temporären Layer mit aktuellen Punkten
+                temp_layer = QgsVectorLayer("Point?crs=" + source_crs.authid(), "temp_points", "memory")
+                temp_provider = temp_layer.dataProvider()
+                temp_provider.addAttributes([QgsField("importance", QVariant.Int), QgsField("point_id", QVariant.Int)])
+                temp_layer.updateFields()
+                
+                # Füge Features batch-weise hinzu für bessere Performance
+                features_to_add = []
+                for i, point in enumerate(voronoi_points):
+                    if point is None or not point.x() or not point.y():
+                        continue
+                    feat = QgsFeature()
+                    feat.setGeometry(QgsGeometry.fromPointXY(point))
+                    feat.setAttributes([point_importance[i], i])
+                    features_to_add.append(feat)
+                
+                if not features_to_add:
+                    feedback.pushInfo("No valid points for Voronoi calculation")
+                    break
+                    
+                temp_provider.addFeatures(features_to_add)
+                
+                # Berechne Voronoi mit 10% Puffer
+                extent = temp_layer.extent()
+                if extent.isEmpty() or extent.width() == 0 or extent.height() == 0:
+                    feedback.pushInfo("Invalid extent for Voronoi calculation")
+                    break
+                    
+                buffer_size = max(extent.width(), extent.height()) * 0.1
+                
+                voronoi_result = processing.run("qgis:voronoipolygons", {
+                    'INPUT': temp_layer,
+                    'BUFFER': buffer_size,
+                    'OUTPUT': 'memory:'
+                }, context=context, feedback=feedback)
+                
+                voronoi_layer = voronoi_result['OUTPUT']
+                
+                # Prüfe ob Voronoi-Layer gültig ist
+                if not voronoi_layer or voronoi_layer.featureCount() == 0:
+                    feedback.pushInfo("No Voronoi polygons generated")
+                    break
+                
+                # Sammle Polygone unter dem Threshold
+                to_delete = []
+                voronoi_polygons = {}
+                
+                for feature in voronoi_layer.getFeatures():
+                    if not feature.geometry() or feature.geometry().isEmpty():
+                        continue
+                        
+                    area = feature.geometry().area()
+                    point_id = feature.attribute('point_id')
+                    
+                    # Verwende point_id für sicheren Index-Zugriff
+                    if point_id is not None and 0 <= point_id < len(voronoi_points):
+                        point_index = point_id
+                        importance = point_importance[point_index]
+                        
+                        # Erstelle Kopie der Geometrie für sichere Speicherung
+                        geom_copy = QgsGeometry(feature.geometry())
+                        voronoi_polygons[point_index] = geom_copy
+                        
+                        if area < area_threshold:
+                            to_delete.append((point_index, importance, area))
+                
+                if not to_delete:
+                    feedback.pushInfo("No more polygons below threshold found")
+                    feedback.pushInfo("Stopping iterations - no polygons to delete")
+                    break
+                
+                feedback.pushInfo(f"Found {len(to_delete)} polygons below threshold")
+                
+                # Sortiere nach Importance (2, dann 0, dann 3)
+                to_delete.sort(key=lambda x: (0 if x[1] == 2 else (1 if x[1] == 0 else 2), x[2]))
+                
+                # Sammle Punkte zum Löschen (keine benachbarten)
+                delete_indices = []
+                
+                for point_idx, importance, area in to_delete:
+                    if point_idx in delete_indices:
+                        continue
+                        
+                    # Prüfe ob bereits ein benachbarter Punkt zum Löschen markiert ist
+                    current_polygon = voronoi_polygons.get(point_idx)
+                    if current_polygon is None:
+                        continue
+                        
+                    can_delete = True
+                    for existing_idx in delete_indices:
+                        existing_polygon = voronoi_polygons.get(existing_idx)
+                        if existing_polygon and current_polygon.intersects(existing_polygon):
+                            can_delete = False
+                            break
+                    
+                    if can_delete:
+                        delete_indices.append(point_idx)
+                
+                if not delete_indices:
+                    feedback.pushInfo("No points can be deleted (all would create adjacent deletions)")
+                    feedback.pushInfo("Stopping iterations - no progress possible")
+                    break
+                
+                feedback.pushInfo(f"Deleting {len(delete_indices)} points")
+                
+                # Entferne die markierten Punkte - erstelle neue Listen statt pop()
+                new_voronoi_points = []
+                new_point_importance = []
+                new_point_features = []
+                
+                for i in range(len(voronoi_points)):
+                    if i not in delete_indices:
+                        new_voronoi_points.append(voronoi_points[i])
+                        new_point_importance.append(point_importance[i])
+                        new_point_features.append(point_features[i])
+                
+                voronoi_points = new_voronoi_points
+                point_importance = new_point_importance
+                point_features = new_point_features
+                
+                # Explizite Garbage Collection
+                import gc
+                gc.collect()
+                
+            except Exception as e:
+                feedback.pushInfo(f"Error in Voronoi calculation: {str(e)}")
+                import traceback
+                feedback.pushInfo(f"Traceback: {traceback.format_exc()}")
+                break
+        
+        feedback.pushInfo(f"Voronoi thinning completed after {iteration} iterations")
+        feedback.pushInfo(f"Final point count: {len(voronoi_points)}")
+        
+        # Gebe die verbleibenden Features zurück
+        thinned_features = []
+        for i, point in enumerate(voronoi_points):
+            original_feature = point_features[i]
+            thinned_features.append(original_feature)
+        
+        return thinned_features
 
-        # Return the results of the algorithm. In this case our only result is
-        # the feature sink which contains the processed features, but some
-        # algorithms may return multiple feature sinks, calculated numeric
-        # statistics, etc. These should all be included in the returned
-        # dictionary, with keys matching the feature corresponding parameter
-        # or output names.
-        return {
-            "output_importance_0": dest_ids[0],
-            "output_importance_1": dest_ids[1],
-            "output_importance_2": dest_ids[2],
-            "output_importance_3": dest_ids[3],
-        }
+    def _write_final_results(self, all_created_features, thinned_features, sinks, feedback, progress_start, progress_end):
+        """
+        Write final results to output sinks.
+        
+        Args:
+            all_created_features: All created features
+            thinned_features: Features that survived Voronoi thinning
+            sinks: Output sinks for different importance classes
+            feedback: Processing feedback object
+            progress_start: Start percentage for progress bar  
+            progress_end: End percentage for progress bar
+        """
+        feedback.pushInfo("Writing final results...")
+        
+        # Sammle thinned Feature IDs für schnelle Lookups
+        thinned_feature_ids = set()
+        for feature in thinned_features:
+            # Erstelle eine eindeutige ID basierend auf Geometrie und Attributen
+            geom_wkt = feature.geometry().asWkt()
+            attrs_key = str(feature.attributes())
+            feature_key = f"{geom_wkt}_{attrs_key}"
+            thinned_feature_ids.add(feature_key)
+        
+        # Füge Features zu den entsprechenden Sinks hinzu
+        progress_range = progress_end - progress_start
+        total_features = len(all_created_features)
+        
+        for current, feature in enumerate(all_created_features):
+            importance = feature.attributes()[-1]  # Importance ist das letzte Attribut
+            
+            # Für Importance 1 Punkte: immer hinzufügen (wurden nicht ausgedünnt)
+            # Für andere: nur hinzufügen wenn sie das Voronoi-Thinning überlebt haben
+            should_add = False
+            if importance == 1:
+                should_add = True
+            else:
+                # Prüfe ob Feature in thinned_features enthalten ist
+                geom_wkt = feature.geometry().asWkt()
+                attrs_key = str(feature.attributes())
+                feature_key = f"{geom_wkt}_{attrs_key}"
+                should_add = feature_key in thinned_feature_ids
+            
+            if should_add and importance in sinks and sinks[importance] is not None:
+                sinks[importance].addFeature(feature, QgsFeatureSink.Flag.FastInsert)
+            
+            # Update progress
+            if total_features > 0:
+                progress = progress_start + (current / total_features) * progress_range
+                feedback.setProgress(int(progress))
+
+
 
     def name(self):
         return "extract_shadow_ip"
