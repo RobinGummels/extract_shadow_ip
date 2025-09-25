@@ -75,24 +75,28 @@ class extract_shadow_ip(QgsProcessingAlgorithm):
             )
         )
 
-        # Output layers für verschiedene Importance-Klassen
+        # Output layers für verschiedene Importance-Klassen (finale ausgedünnte Punkte)
         self.addParameter(
             QgsProcessingParameterFeatureSink(
-                "output_importance_3", "Definitiv benötigt Gebäude"
+                "output_final_importance_3", "Final: Definitiv benötigt Gebäude (nach Thinning)"
             )
         )
         self.addParameter(
             QgsProcessingParameterFeatureSink(
-                "output_importance_2", "Weitere Prüfung erforderlich"
+                "output_final_importance_2", "Final: Weitere Prüfung erforderlich (nach Thinning)"
             )
         )
         self.addParameter(
             QgsProcessingParameterFeatureSink(
-                "output_importance_1", "Nicht benötigte Gebäude"
+                "output_final_importance_0", "Final: Zuordnungsfehler (nach Thinning)"
             )
         )
+        
+        # Output layer für alle ursprünglich extrahierten Punkte (vor Thinning)
         self.addParameter(
-            QgsProcessingParameterFeatureSink("output_importance_0", "Zuordnungsfehler")
+            QgsProcessingParameterFeatureSink(
+                "output_all_extracted", "Alle extrahierten Punkte (vor Thinning)"
+            )
         )
 
     def processAlgorithm(
@@ -116,7 +120,7 @@ class extract_shadow_ip(QgsProcessingAlgorithm):
         )
         
         # Setup output sinks
-        sinks, dest_ids, fields = self._setup_output_sinks(
+        final_sinks, final_dest_ids, all_extracted_sink, all_extracted_dest_id, fields = self._setup_output_sinks(
             parameters, context, input_buildings
         )
         
@@ -129,32 +133,46 @@ class extract_shadow_ip(QgsProcessingAlgorithm):
             building_features, feedback, progress_start=0, progress_end=30
         )
         
-        # Step 2: Extract shadow points (30-50%)
+        # Step 2: Extract shadow points (30-60%)
         feedback.pushInfo("Extracting shadow points...")
         all_created_features = self._extract_shadow_points(
             building_features, input_zb_wea, importance_list, fields,
-            feedback, progress_start=30, progress_end=50
+            feedback, progress_start=30, progress_end=60
         )
         
-        # Step 3: Voronoi thinning (50-70%)
+        # Step 3: Voronoi thinning in multiple passes (60-90%)
         feedback.pushInfo("Starting Voronoi thinning...")
+        
+        # Pass 1: Remove importance class 2 points (60-70%)
         thinned_features = self._perform_voronoi_thinning(
-            all_created_features, area_threshold, input_buildings.sourceCrs(),
-            context, feedback, progress_start=50, progress_end=70
+            all_created_features, area_threshold, 2, input_buildings.sourceCrs(),
+            context, feedback, progress_start=60, progress_end=70
+        )
+
+        # Pass 2: Remove importance class 0 points (70-80%)
+        thinned_features = self._perform_voronoi_thinning(
+            thinned_features, area_threshold, 0, input_buildings.sourceCrs(),
+            context, feedback, progress_start=70, progress_end=80
+        )
+
+        # Pass 3: Remove importance class 3 points (80-90%)
+        thinned_features = self._perform_voronoi_thinning(
+            thinned_features, area_threshold, 3, input_buildings.sourceCrs(),
+            context, feedback, progress_start=80, progress_end=90
         )
         
-        # Step 4: Write final results (70-100%)
+        # Step 4: Write final results (90-100%)
         feedback.pushInfo("Writing final results...")
         self._write_final_results(
-            all_created_features, thinned_features, sinks,
-            feedback, progress_start=70, progress_end=100
+            all_created_features, thinned_features, final_sinks, all_extracted_sink,
+            feedback, progress_start=90, progress_end=100
         )
         
         return {
-            "output_importance_0": dest_ids[0],
-            "output_importance_1": dest_ids[1],
-            "output_importance_2": dest_ids[2],
-            "output_importance_3": dest_ids[3],
+            "output_final_importance_0": final_dest_ids[0],
+            "output_final_importance_2": final_dest_ids[2],
+            "output_final_importance_3": final_dest_ids[3],
+            "output_all_extracted": all_extracted_dest_id,
         }
 
     def _validate_inputs(self, parameters, context):
@@ -195,29 +213,39 @@ class extract_shadow_ip(QgsProcessingAlgorithm):
         fields = input_buildings.fields()
         fields.append(QgsField("importance", QVariant.Int))
 
-        # Create sinks for each importance class
-        sinks = {}
-        dest_ids = {}
+        # Create sinks for final importance classes (after thinning)
+        final_sinks = {}
+        final_dest_ids = {}
 
-        for importance in [0, 1, 2, 3]:
+        for importance in [0, 2, 3]:
             (sink, dest_id) = self.parameterAsSink(
                 parameters,
-                f"output_importance_{importance}",
+                f"output_final_importance_{importance}",
                 context,
                 fields,  # mit importance-Feld
                 QgsWkbTypes.Point,
                 input_buildings.sourceCrs(),
             )
-            sinks[importance] = sink
-            dest_ids[importance] = dest_id
+            final_sinks[importance] = sink
+            final_dest_ids[importance] = dest_id
+
+        # Create sink for all extracted points (before thinning)
+        (all_extracted_sink, all_extracted_dest_id) = self.parameterAsSink(
+            parameters,
+            "output_all_extracted",
+            context,
+            fields,  # mit importance-Feld
+            QgsWkbTypes.Point,
+            input_buildings.sourceCrs(),
+        )
 
         # If sink was not created, throw an exception
-        if any(sink is None for sink in sinks.values()):
+        if any(sink is None for sink in final_sinks.values()) or all_extracted_sink is None:
             raise QgsProcessingException(
-                self.invalidSinkError(parameters, "output_importance_0")
+                self.invalidSinkError(parameters, "output_final_importance_0")
             )
             
-        return sinks, dest_ids, fields
+        return final_sinks, final_dest_ids, all_extracted_sink, all_extracted_dest_id, fields
 
     def _get_building_classification_codes(self):
         """
@@ -616,13 +644,14 @@ class extract_shadow_ip(QgsProcessingAlgorithm):
         
         return all_created_features
 
-    def _perform_voronoi_thinning(self, all_created_features, area_threshold, source_crs, context, feedback, progress_start, progress_end):
+    def _perform_voronoi_thinning(self, all_created_features, area_threshold, target_importance_class, source_crs, context, feedback, progress_start, progress_end):
         """
-        Perform Voronoi-based thinning of shadow points.
+        Perform Voronoi-based thinning of shadow points for a specific importance class.
         
         Args:
             all_created_features: List of all created features
             area_threshold: Minimum area threshold for polygons
+            target_importance_class: Only points of this importance class can be deleted (0, 2, or 3)
             source_crs: Source coordinate reference system
             context: Processing context
             feedback: Processing feedback object
@@ -630,11 +659,11 @@ class extract_shadow_ip(QgsProcessingAlgorithm):
             progress_end: End percentage for progress bar
             
         Returns:
-            list: Thinned features after Voronoi processing
+            list: Features after thinning (with some features potentially removed)
         """
-        feedback.pushInfo("Starting Voronoi thinning process...")
+        feedback.pushInfo(f"Starting Voronoi thinning process for importance class {target_importance_class}...")
         
-        # Sammle Features mit Importance 0, 2, 3 für Voronoi-Berechnung aus bereits berechneten Features
+        # Sammle ALLE Features für Voronoi-Berechnung (aber nur target_importance_class kann gelöscht werden)
         voronoi_points = []
         point_importance = []
         point_features = []
@@ -642,7 +671,7 @@ class extract_shadow_ip(QgsProcessingAlgorithm):
         for feature in all_created_features:
             importance = feature.attributes()[-1]  # Importance ist das letzte Attribut
             
-            # Nur Punkte mit Importance 0, 2, 3 für Voronoi verwenden
+            # Alle Punkte mit Importance 0, 2, 3 für Voronoi verwenden (für korrekten Kontext)
             if importance in [0, 2, 3]:
                 voronoi_points.append(feature.geometry().asPoint())
                 point_importance.append(importance)
@@ -732,18 +761,18 @@ class extract_shadow_ip(QgsProcessingAlgorithm):
                         geom_copy = QgsGeometry(feature.geometry())
                         voronoi_polygons[point_index] = geom_copy
                         
-                        if area < area_threshold:
+                        if area < area_threshold and importance == target_importance_class:
                             to_delete.append((point_index, importance, area))
                 
                 if not to_delete:
-                    feedback.pushInfo("No more polygons below threshold found")
+                    feedback.pushInfo(f"No more polygons below threshold found for importance class {target_importance_class}")
                     feedback.pushInfo("Stopping iterations - no polygons to delete")
                     break
                 
-                feedback.pushInfo(f"Found {len(to_delete)} polygons below threshold")
+                feedback.pushInfo(f"Found {len(to_delete)} polygons below threshold for importance class {target_importance_class}")
                 
-                # Sortiere nach Importance (2, dann 0, dann 3)
-                to_delete.sort(key=lambda x: (0 if x[1] == 2 else (1 if x[1] == 0 else 2), x[2]))
+                # Sortiere nach Fläche (kleinste zuerst)
+                to_delete.sort(key=lambda x: x[2])
                 
                 # Sammle Punkte zum Löschen (keine benachbarten)
                 delete_indices = []
@@ -799,61 +828,71 @@ class extract_shadow_ip(QgsProcessingAlgorithm):
                 feedback.pushInfo(f"Traceback: {traceback.format_exc()}")
                 break
         
-        feedback.pushInfo(f"Voronoi thinning completed after {iteration} iterations")
+        feedback.pushInfo(f"Voronoi thinning completed after {iteration} iterations for importance class {target_importance_class}")
         feedback.pushInfo(f"Final point count: {len(voronoi_points)}")
         
-        # Gebe die verbleibenden Features zurück
-        thinned_features = []
+        # Erstelle neue Liste mit allen ursprünglichen Features
+        # Entferne nur die Features, die in voronoi_points nicht mehr enthalten sind
+        remaining_voronoi_features = set()
         for i, point in enumerate(voronoi_points):
             original_feature = point_features[i]
-            thinned_features.append(original_feature)
+            # Erstelle eindeutige ID für Vergleich
+            geom_wkt = original_feature.geometry().asWkt()
+            attrs_key = str(original_feature.attributes())
+            feature_key = f"{geom_wkt}_{attrs_key}"
+            remaining_voronoi_features.add(feature_key)
+        
+        # Filtere all_created_features: behalte alle außer den gelöschten
+        thinned_features = []
+        for feature in all_created_features:
+            importance = feature.attributes()[-1]
+            
+            if importance == 1:
+                # Importance 1 Features werden nie ausgedünnt
+                thinned_features.append(feature)
+            elif importance in [0, 2, 3]:
+                # Prüfe ob Feature in den verbleibenden Voronoi-Features enthalten ist
+                geom_wkt = feature.geometry().asWkt()
+                attrs_key = str(feature.attributes())
+                feature_key = f"{geom_wkt}_{attrs_key}"
+                
+                if feature_key in remaining_voronoi_features:
+                    thinned_features.append(feature)
+                # Wenn nicht in remaining_voronoi_features: wurde gelöscht, also nicht hinzufügen
         
         return thinned_features
 
-    def _write_final_results(self, all_created_features, thinned_features, sinks, feedback, progress_start, progress_end):
+    def _write_final_results(self, all_created_features, thinned_features, final_sinks, all_extracted_sink, feedback, progress_start, progress_end):
         """
         Write final results to output sinks.
         
         Args:
-            all_created_features: All created features
+            all_created_features: All created features (before thinning)
             thinned_features: Features that survived Voronoi thinning
-            sinks: Output sinks for different importance classes
+            final_sinks: Output sinks for final importance classes (0, 2, 3)
+            all_extracted_sink: Output sink for all extracted points
             feedback: Processing feedback object
             progress_start: Start percentage for progress bar  
             progress_end: End percentage for progress bar
         """
         feedback.pushInfo("Writing final results...")
         
-        # Sammle thinned Feature IDs für schnelle Lookups
-        thinned_feature_ids = set()
-        for feature in thinned_features:
-            # Erstelle eine eindeutige ID basierend auf Geometrie und Attributen
-            geom_wkt = feature.geometry().asWkt()
-            attrs_key = str(feature.attributes())
-            feature_key = f"{geom_wkt}_{attrs_key}"
-            thinned_feature_ids.add(feature_key)
+        # 1. Schreibe alle extrahierten Punkte (vor Thinning) in den "all_extracted" Layer
+        feedback.pushInfo("Writing all extracted points...")
+        for feature in all_created_features:
+            all_extracted_sink.addFeature(feature, QgsFeatureSink.Flag.FastInsert)
         
-        # Füge Features zu den entsprechenden Sinks hinzu
+        # 2. Schreibe finale ausgedünnte Punkte (nur Importance 0, 2, 3)
+        feedback.pushInfo("Writing final thinned points...")
         progress_range = progress_end - progress_start
-        total_features = len(all_created_features)
+        total_features = len(thinned_features)
         
-        for current, feature in enumerate(all_created_features):
+        for current, feature in enumerate(thinned_features):
             importance = feature.attributes()[-1]  # Importance ist das letzte Attribut
             
-            # Für Importance 1 Punkte: immer hinzufügen (wurden nicht ausgedünnt)
-            # Für andere: nur hinzufügen wenn sie das Voronoi-Thinning überlebt haben
-            should_add = False
-            if importance == 1:
-                should_add = True
-            else:
-                # Prüfe ob Feature in thinned_features enthalten ist
-                geom_wkt = feature.geometry().asWkt()
-                attrs_key = str(feature.attributes())
-                feature_key = f"{geom_wkt}_{attrs_key}"
-                should_add = feature_key in thinned_feature_ids
-            
-            if should_add and importance in sinks and sinks[importance] is not None:
-                sinks[importance].addFeature(feature, QgsFeatureSink.Flag.FastInsert)
+            # Nur Importance 0, 2, 3 zu den finalen Layern hinzufügen
+            if importance in [0, 2, 3] and importance in final_sinks and final_sinks[importance] is not None:
+                final_sinks[importance].addFeature(feature, QgsFeatureSink.Flag.FastInsert)
             
             # Update progress
             if total_features > 0:
