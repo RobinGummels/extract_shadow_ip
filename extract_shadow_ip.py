@@ -606,14 +606,18 @@ class extract_shadow_ip(QgsProcessingAlgorithm):
                     for ring in part:  # ring ist eine Liste von QgsPointXY
                         for i in range(len(ring) - 1):
                             line = QgsGeometry.fromPolylineXY([ring[i], ring[i + 1]])
-                            midpoint = line.interpolate(line.length() / 2)
-                            points.append(midpoint)
+                            # Hausseiten kürzer als 2m nicht berücksichtigen
+                            if line.length() > 2:
+                                midpoint = line.interpolate(line.length() / 2)
+                                points.append(midpoint)
             else:
                 for ring in geom.asPolygon():
                     for i in range(len(ring) - 1):
                         line = QgsGeometry.fromPolylineXY([ring[i], ring[i + 1]])
-                        midpoint = line.interpolate(line.length() / 2)
-                        points.append(midpoint)
+                        # Hausseiten kürzer als 2m nicht berücksichtigen
+                        if line.length() > 2:
+                            midpoint = line.interpolate(line.length() / 2)
+                            points.append(midpoint)
 
             # Check which points is the closest to the points of input_zb_wea
             # Only add the point with the closest distance to any input_zb_wea feature to the feature sink
