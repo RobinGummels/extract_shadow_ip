@@ -70,8 +70,19 @@ class extract_shadow_ip(QgsProcessingAlgorithm):
                 "area_threshold",
                 self.tr("Area threshold for Voronoi thinning (m²)"),
                 type=QgsProcessingParameterNumber.Double,
-                defaultValue=25000.0,
+                defaultValue=2500.0,
                 minValue=1.0
+            )
+        )
+
+        # Mindestabstand zwischen IP
+        self.addParameter(
+            QgsProcessingParameterNumber(
+                "min_distance",
+                self.tr("Minimum distance between IP points (m)"),
+                type=QgsProcessingParameterNumber.Double,
+                defaultValue=20.0,
+                minValue=0.0
             )
         )
 
@@ -109,13 +120,15 @@ class extract_shadow_ip(QgsProcessingAlgorithm):
         Main processing function that coordinates all algorithm steps.
         
         Progress distribution:
-        - Building classification: 30%
-        - Point extraction: 50% 
-        - Voronoi thinning: 20%
+        - Building classification: 25%
+        - Point extraction: 25% 
+        - Distance thinning: 10%
+        - Voronoi thinning: 30%
+        - Writing results: 10%
         """
         
         # Retrieve and validate inputs
-        input_buildings, input_zb_wea, area_threshold = self._validate_inputs(
+        input_buildings, input_zb_wea, area_threshold, min_distance = self._validate_inputs(
             parameters, context
         )
         
@@ -127,25 +140,31 @@ class extract_shadow_ip(QgsProcessingAlgorithm):
         # Get building features
         building_features = list(input_buildings.getFeatures())
         
-        # Step 1: Classify buildings (0-30%)
+        # Step 1: Classify buildings (0-25%)
         feedback.pushInfo("Starting building classification...")
         importance_list = self._classify_buildings(
-            building_features, feedback, progress_start=0, progress_end=30
+            building_features, feedback, progress_start=0, progress_end=25
         )
         
-        # Step 2: Extract shadow points (30-60%)
+        # Step 2: Extract shadow points (25-50%)
         feedback.pushInfo("Extracting shadow points...")
         all_created_features = self._extract_shadow_points(
             building_features, input_zb_wea, importance_list, fields,
-            feedback, progress_start=30, progress_end=60
+            feedback, progress_start=25, progress_end=50
         )
         
-        # Step 3: Voronoi thinning in multiple passes (60-90%)
+        # Step 3: Distance-based thinning (50-60%)
+        feedback.pushInfo("Starting distance-based thinning...")
+        distance_thinned_features = self._perform_distance_thinning(
+            all_created_features, min_distance, feedback, progress_start=50, progress_end=60
+        )
+        
+        # Step 4: Voronoi thinning in multiple passes (60-90%)
         feedback.pushInfo("Starting Voronoi thinning...")
         
         # Pass 1: Remove importance class 2 points (60-70%)
         thinned_features = self._perform_voronoi_thinning(
-            all_created_features, area_threshold, 2, input_buildings.sourceCrs(),
+            distance_thinned_features, area_threshold, 2, input_buildings.sourceCrs(),
             context, feedback, progress_start=60, progress_end=70
         )
 
@@ -161,7 +180,7 @@ class extract_shadow_ip(QgsProcessingAlgorithm):
             context, feedback, progress_start=80, progress_end=90
         )
         
-        # Step 4: Write final results (90-100%)
+        # Step 5: Write final results (90-100%)
         feedback.pushInfo("Writing final results...")
         self._write_final_results(
             all_created_features, thinned_features, final_sinks, all_extracted_sink,
@@ -180,7 +199,7 @@ class extract_shadow_ip(QgsProcessingAlgorithm):
         Validate and retrieve input parameters.
         
         Returns:
-            tuple: (input_buildings, input_zb_wea, area_threshold)
+            tuple: (input_buildings, input_zb_wea, area_threshold, min_distance)
         """
         # Retrieve the inputs
         input_buildings = self.parameterAsSource(
@@ -188,6 +207,7 @@ class extract_shadow_ip(QgsProcessingAlgorithm):
         )
         input_zb_wea = self.parameterAsSource(parameters, self.input_zb_wea, context)
         area_threshold = self.parameterAsDouble(parameters, "area_threshold", context)
+        min_distance = self.parameterAsDouble(parameters, "min_distance", context)
 
         # If input was not found, throw an exception
         if input_buildings is None:
@@ -200,7 +220,7 @@ class extract_shadow_ip(QgsProcessingAlgorithm):
                 self.invalidSourceError(parameters, self.input_zb_wea)
             )
             
-        return input_buildings, input_zb_wea, area_threshold
+        return input_buildings, input_zb_wea, area_threshold, min_distance
 
     def _setup_output_sinks(self, parameters, context, input_buildings):
         """
@@ -647,6 +667,110 @@ class extract_shadow_ip(QgsProcessingAlgorithm):
                 feedback.setProgress(int(progress))
         
         return all_created_features
+
+    def _perform_distance_thinning(self, all_created_features, min_distance, feedback, progress_start, progress_end):
+        """
+        Perform distance-based thinning of shadow points with hierarchical rules.
+        
+        Rules:
+        1. Remove importance 2 points that are too close to importance 0 or 3 points
+        2. Remove importance 0 points that are too close to importance 3 points
+        
+        Args:
+            all_created_features: List of all created features
+            min_distance: Minimum distance threshold in meters
+            feedback: Processing feedback object
+            progress_start: Start percentage for progress bar
+            progress_end: End percentage for progress bar
+            
+        Returns:
+            list: Features after distance-based thinning
+        """
+        if min_distance <= 0:
+            feedback.pushInfo("Distance thinning disabled (min_distance <= 0)")
+            return all_created_features
+            
+        feedback.pushInfo(f"Starting distance-based thinning with min_distance: {min_distance}m")
+        
+        # Separiere Features nach Importance-Klassen
+        features_by_importance = {0: [], 2: [], 3: []}
+        other_features = []
+        
+        for feature in all_created_features:
+            importance = feature.attributes()[-1]  # Importance ist das letzte Attribut
+            if importance in features_by_importance:
+                features_by_importance[importance].append(feature)
+            else:
+                other_features.append(feature)
+        
+        feedback.pushInfo(f"Features by importance: 0={len(features_by_importance[0])}, 2={len(features_by_importance[2])}, 3={len(features_by_importance[3])}")
+        
+        # Führe hierarchische Thinning-Regeln aus
+        features_to_keep = []
+        
+        # Regel 1: Prüfe importance 2 gegen importance 0 und 3
+        feedback.pushInfo("Rule 1: Checking importance 2 points against importance 0 and 3...")
+        feedback.setProgress(int(progress_start + (progress_end - progress_start) * 0.3))
+        
+        for feature_2 in features_by_importance[2]:
+            point_2 = feature_2.geometry().asPoint()
+            keep_feature = True
+            
+            # Prüfe gegen importance 0 Punkte
+            for feature_0 in features_by_importance[0]:
+                point_0 = feature_0.geometry().asPoint()
+                distance = point_2.distance(point_0)
+                if distance < min_distance:
+                    keep_feature = False
+                    break
+            
+            # Prüfe gegen importance 3 Punkte (nur wenn noch nicht entfernt)
+            if keep_feature:
+                for feature_3 in features_by_importance[3]:
+                    point_3 = feature_3.geometry().asPoint()
+                    distance = point_2.distance(point_3)
+                    if distance < min_distance:
+                        keep_feature = False
+                        break
+            
+            if keep_feature:
+                features_to_keep.append(feature_2)
+        
+        feedback.pushInfo(f"After rule 1: {len(features_to_keep)} importance 2 points kept (removed {len(features_by_importance[2]) - len(features_to_keep)})")
+        
+        # Regel 2: Prüfe importance 0 gegen importance 3
+        feedback.pushInfo("Rule 2: Checking importance 0 points against importance 3...")
+        feedback.setProgress(int(progress_start + (progress_end - progress_start) * 0.6))
+        
+        kept_importance_0 = []
+        for feature_0 in features_by_importance[0]:
+            point_0 = feature_0.geometry().asPoint()
+            keep_feature = True
+            
+            # Prüfe gegen importance 3 Punkte
+            for feature_3 in features_by_importance[3]:
+                point_3 = feature_3.geometry().asPoint()
+                distance = point_0.distance(point_3)
+                if distance < min_distance:
+                    keep_feature = False
+                    break
+            
+            if keep_feature:
+                kept_importance_0.append(feature_0)
+        
+        feedback.pushInfo(f"After rule 2: {len(kept_importance_0)} importance 0 points kept (removed {len(features_by_importance[0]) - len(kept_importance_0)})")
+        
+        # Sammle alle behaltenen Features
+        final_features = []
+        final_features.extend(kept_importance_0)  # Gefilterte importance 0
+        final_features.extend(features_to_keep)   # Gefilterte importance 2
+        final_features.extend(features_by_importance[3])  # Alle importance 3 (werden nie entfernt)
+        final_features.extend(other_features)     # Andere Features (importance 1 etc.)
+        
+        feedback.setProgress(int(progress_end))
+        feedback.pushInfo(f"Distance thinning completed. Features: {len(all_created_features)} -> {len(final_features)} (removed {len(all_created_features) - len(final_features)})")
+        
+        return final_features
 
     def _perform_voronoi_thinning(self, all_created_features, area_threshold, target_importance_class, source_crs, context, feedback, progress_start, progress_end):
         """
